@@ -47,13 +47,6 @@ interface TechStack {
   configs: string[];
 }
 
-interface ProgressUpdate {
-  completed?: unknown;
-  inProgress?: unknown;
-  blocked?: unknown;
-  phase?: unknown;
-}
-
 interface McpSettings {
   mcpServers: {
     [key: string]: {
