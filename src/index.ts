@@ -10,8 +10,10 @@ import {
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import fs from 'fs/promises';
+import { realpathSync } from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 interface MemoryBankFile {
   path: string;
@@ -45,15 +47,11 @@ interface TechStack {
   configs: string[];
 }
 
-interface SessionState {
-  questionCount: number;
-  lastPrompted: string;
-  currentPhase: string;
-  taskUpdates: {
-    completed: Set<string>;
-    inProgress: Set<string>;
-    blocked: Set<string>;
-  };
+interface ProgressUpdate {
+  completed?: unknown;
+  inProgress?: unknown;
+  blocked?: unknown;
+  phase?: unknown;
 }
 
 interface McpSettings {
@@ -69,31 +67,37 @@ interface McpSettings {
 }
 
 class MemoryBankServer {
-  private sessionState: SessionState;
   private server: Server;
   private memoryBankPath: string;
-  private static readonly MCP_SETTINGS_PATHS = {
-    linux: '.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
-    darwin: 'Library/Application Support/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
-    win32: 'AppData/Roaming/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json'
+  private lastInitializedProject?: string;
+  private static readonly MEMORY_BANK_DIR = 'memory-bank';
+  private static readonly SERVER_VERSION = '0.2.0';
+  private static readonly MCP_SETTINGS_CANDIDATES = {
+    linux: [
+      '.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      '.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      '.config/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      '.config/Windsurf/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+    ],
+    darwin: [
+      'Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      'Library/Application Support/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      'Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      'Library/Application Support/Windsurf/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+    ],
+    win32: [
+      'AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      'AppData/Roaming/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      'AppData/Roaming/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+      'AppData/Roaming/Windsurf/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json',
+    ],
   };
 
   constructor() {
-    this.sessionState = {
-      questionCount: 0,
-      lastPrompted: new Date().toISOString().split('T')[0],
-      currentPhase: 'Development',
-      taskUpdates: {
-        completed: new Set<string>(),
-        inProgress: new Set<string>(),
-        blocked: new Set<string>()
-      }
-    };
-
     this.server = new Server(
       {
         name: 'memory-bank-server',
-        version: '0.1.0',
+        version: MemoryBankServer.SERVER_VERSION,
       },
       {
         capabilities: {
@@ -103,7 +107,7 @@ class MemoryBankServer {
       }
     );
 
-    this.memoryBankPath = 'memory-bank';
+    this.memoryBankPath = MemoryBankServer.MEMORY_BANK_DIR;
     this.setupToolHandlers();
     this.setupResourceHandlers();
 
@@ -115,10 +119,12 @@ class MemoryBankServer {
         console.error('[MCP Error]', error);
       }
     };
-    process.on('SIGINT', async () => {
+    const shutdown = async () => {
       await this.server.close();
       process.exit(0);
-    });
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   }
 
   private setupToolHandlers() {
@@ -133,6 +139,11 @@ class MemoryBankServer {
               projectPath: {
                 type: 'string',
                 description: 'Path to project root directory',
+              },
+              force: {
+                type: 'boolean',
+                description: 'Overwrite existing memory bank files instead of preserving them',
+                default: false,
               },
             },
             required: ['projectPath'],
@@ -232,6 +243,7 @@ class MemoryBankServer {
                   completed: { type: 'array', items: { type: 'string' } },
                   inProgress: { type: 'array', items: { type: 'string' } },
                   blocked: { type: 'array', items: { type: 'string' } },
+                  phase: { type: 'string', description: 'Optional current project phase' },
                 },
                 required: ['completed', 'inProgress'],
               },
@@ -300,13 +312,7 @@ class MemoryBankServer {
     }));
 
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      const projectPath = process.env.PROJECT_PATH;
-      if (!projectPath) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          'PROJECT_PATH environment variable not set'
-        );
-      }
+      const projectPath = this.resolveResourceProjectPath();
 
       try {
         const content = await this.readMemoryBankFile(
@@ -347,7 +353,7 @@ class MemoryBankServer {
       };
     } catch (error) {
       return {
-        name: 'Unknown',
+        name: path.basename(projectPath) || 'Unknown',
         version: '0.1.0',
         description: 'No description provided',
         license: 'Not specified',
@@ -392,45 +398,89 @@ class MemoryBankServer {
       'package.json',
       'tsconfig.json',
       '.eslintrc',
+      '.eslintrc.json',
+      '.eslintrc.js',
       '.prettierrc',
       '.babelrc',
       '.env',
       'webpack.config.js',
       'vite.config.js',
+      'vite.config.ts',
       'next.config.js',
+      'next.config.mjs',
       '.gitignore',
       'jest.config.js',
-      'rollup.config.js'
+      'rollup.config.js',
+      'pnpm-workspace.yaml',
+      'Cargo.toml',
+      'go.mod',
+      'pyproject.toml',
+      'requirements.txt',
+      'Gemfile',
+      'composer.json',
+      'Dockerfile',
+      'docker-compose.yml',
+      '.editorconfig'
     ]);
 
+    // Directories that never contribute useful project metadata and can be huge.
+    const ignoredDirectories = new Set([
+      'node_modules', '.git', '.hg', '.svn', 'build', 'dist', 'out', 'coverage',
+      '.next', '.nuxt', '.svelte-kit', '.cache', '.turbo', '.output', 'vendor',
+      'target', 'obj', '.venv', 'venv', 'env', '__pycache__', '.pytest_cache',
+      '.mypy_cache', '.ruff_cache', '.gradle', '.idea', '.terraform'
+    ]);
+
+    let scannedFiles = 0;
+    const maxScannedFiles = 20000;
+
+    const scan = async (directory: string, depth: number): Promise<void> => {
+      if (depth > 12 || scannedFiles >= maxScannedFiles) return;
+
+      let entries;
+      try {
+        entries = await fs.readdir(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        if (scannedFiles >= maxScannedFiles) return;
+        if (entry.isSymbolicLink()) continue;
+
+        const entryPath = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          if (!ignoredDirectories.has(entry.name)) {
+            await scan(entryPath, depth + 1);
+          }
+          continue;
+        }
+
+        if (!entry.isFile()) continue;
+        scannedFiles++;
+
+        const ext = path.extname(entry.name).toLowerCase().substring(1);
+        const language = validLanguages.get(ext);
+        if (language) {
+          stack.languages.add(language);
+        }
+
+        if (relevantConfigs.has(entry.name)) {
+          stack.configs.push(entry.name);
+        }
+      }
+    };
+
+    await scan(projectPath, 0);
+    stack.configs = [...new Set(stack.configs)];
+
+    // Detect frameworks from package.json (projects without one are still valid).
     try {
-      const files = await fs.readdir(projectPath, { recursive: true });
-      
-      // Process each file
-      files.forEach((file: string) => {
-        const ext = path.extname(file).toLowerCase().substring(1);
-        const basename = path.basename(file);
-        
-        // Add valid programming languages
-        if (validLanguages.has(ext)) {
-          stack.languages.add(validLanguages.get(ext)!);
-        }
-        
-        // Add relevant config files
-        if (relevantConfigs.has(basename)) {
-          stack.configs.push(basename);
-        }
-      });
-
-      // Remove duplicates from configs
-      stack.configs = [...new Set(stack.configs)];
-
-      // Detect frameworks from package.json
       const packageJson = await fs.readFile(path.join(projectPath, 'package.json'), 'utf8');
       const { dependencies = {}, devDependencies = {} } = JSON.parse(packageJson);
-      
+
       const allDeps = { ...dependencies, ...devDependencies };
-      const frameworkDetection = {
+      const frameworkDetection: Record<string, string> = {
         'react': 'React',
         'next': 'Next.js',
         'express': 'Express',
@@ -442,19 +492,27 @@ class MemoryBankServer {
         'fastify': 'Fastify',
         'koa': 'Koa',
         'gatsby': 'Gatsby',
-        'nuxt': 'Nuxt.js'
+        'nuxt': 'Nuxt.js',
+        'hono': 'Hono'
       };
 
       for (const [dep, framework] of Object.entries(frameworkDetection)) {
-        if (allDeps[dep]) {
+        if (allDeps[dep] && !stack.frameworks.includes(framework)) {
           stack.frameworks.push(framework);
         }
       }
-
-      return stack;
-    } catch (error) {
-      return stack;
+    } catch {
+      // No package.json, or it is not valid JSON.
     }
+
+    const languages = Array.from(stack.languages);
+    if (languages.includes('TypeScript') || languages.includes('JavaScript')) {
+      stack.runtime = 'Node.js';
+    } else if (languages.length > 0) {
+      stack.runtime = languages[0];
+    }
+
+    return stack;
   }
 
   private generateInitialDecisions(info: ProjectInfo, stack: TechStack): Decision[] {
@@ -533,34 +591,100 @@ Development:
 ${formatDeps(keyDevDeps)}
 
 ## Configuration
-${stack.configs.sort().map(c => `- ${c}`).join('\n')}
+${stack.configs.length ? stack.configs.sort().map(c => `- ${c}`).join('\n') : 'None'}
 
 ## Architecture
 - Type: ${stack.frameworks.length ? `Framework-based (${stack.frameworks.join(', ')})` : 'Modular'}
-- Language: ${Array.from(stack.languages)[0] || 'Not detected'}
-- Environment: Node.js
+- Language: ${Array.from(stack.languages).sort()[0] || 'Not detected'}
+- Environment: ${stack.runtime}
 ${info.dependencies.includes('@modelcontextprotocol/sdk') ? '- MCP Server Implementation' : ''}
 `;
   }
 
-  public async handleInitializeMemoryBank(args: any) {
-    const projectPath = args.projectPath;
-    if (!projectPath) {
+  /**
+   * Resolve a user supplied project path to an absolute, existing directory.
+   */
+  private async resolveProjectPath(projectPath: unknown): Promise<string> {
+    if (typeof projectPath !== 'string' || projectPath.trim().length === 0) {
       throw new McpError(ErrorCode.InvalidParams, 'Project path is required');
     }
 
-    // Convert to absolute path if not already
-    const absoluteProjectPath = path.isAbsolute(projectPath) 
-      ? projectPath 
-      : path.resolve(process.cwd(), projectPath);
+    let expanded = projectPath.trim();
+    if (expanded === '~') {
+      expanded = os.homedir();
+    } else if (expanded.startsWith(`~${path.sep}`) || expanded.startsWith('~/')) {
+      expanded = path.join(os.homedir(), expanded.slice(2));
+    }
+
+    const absoluteProjectPath = path.resolve(expanded);
+
+    let stats;
+    try {
+      stats = await fs.stat(absoluteProjectPath);
+    } catch {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Project path does not exist: ${absoluteProjectPath}`
+      );
+    }
+
+    if (!stats.isDirectory()) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Project path is not a directory: ${absoluteProjectPath}`
+      );
+    }
+
+    return absoluteProjectPath;
+  }
+
+  /**
+   * Resolve a project path and ensure that its memory bank has been initialized.
+   */
+  private async resolveMemoryBankPath(projectPath: unknown): Promise<{
+    projectPath: string;
+    memoryBankPath: string;
+  }> {
+    const absoluteProjectPath = await this.resolveProjectPath(projectPath);
+    const memoryBankPath = path.join(absoluteProjectPath, this.memoryBankPath);
 
     try {
-      const memoryBankPath = path.join(projectPath, this.memoryBankPath);
+      const stats = await fs.stat(memoryBankPath);
+      if (!stats.isDirectory()) {
+        throw new Error('not a directory');
+      }
+    } catch {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Memory Bank is not initialized at ${memoryBankPath}. Run initialize_memory_bank first.`
+      );
+    }
+
+    return { projectPath: absoluteProjectPath, memoryBankPath };
+  }
+
+  /**
+   * Determine which project resources should be read. Prefer the project that
+   * was initialized by this process, then PROJECT_PATH, then the cwd.
+   */
+  private resolveResourceProjectPath(): string {
+    return this.lastInitializedProject || process.env.PROJECT_PATH || process.cwd();
+  }
+
+
+  public async handleInitializeMemoryBank(args: any) {
+    const absoluteProjectPath = await this.resolveProjectPath(args?.projectPath);
+    const force = args?.force === true;
+
+    this.lastInitializedProject = absoluteProjectPath;
+
+    try {
+      const memoryBankPath = path.join(absoluteProjectPath, this.memoryBankPath);
       await fs.mkdir(memoryBankPath, { recursive: true });
 
       // Gather project information
-      const projectInfo = await this.getProjectInfo(projectPath);
-      const techStack = await this.detectTechStack(projectPath);
+      const projectInfo = await this.getProjectInfo(absoluteProjectPath);
+      const techStack = await this.detectTechStack(absoluteProjectPath);
       const projectContext = this.formatProjectContext(projectInfo, techStack);
 
       // Generate initial decisions
@@ -645,26 +769,51 @@ Initialization
         },
       ];
 
+      const created: string[] = [];
+      const preserved: string[] = [];
+
       for (const file of files) {
-        await fs.writeFile(
-          path.join(memoryBankPath, file.path),
-          file.content,
-          'utf8'
-        );
+        const filePath = path.join(memoryBankPath, file.path);
+        const exists = await this.fileExists(filePath);
+
+        // Never destroy an existing memory bank unless the caller explicitly
+        // asks for it. This makes initialization safe to run repeatedly.
+        if (exists && !force) {
+          preserved.push(file.path);
+          continue;
+        }
+
+        await fs.writeFile(filePath, file.content, 'utf8');
+        created.push(file.path);
       }
 
-      // Update MCP settings
-      await this.updateMcpSettings(absoluteProjectPath);
+      // Configure Cline's MCP settings on a best-effort basis. A missing or
+      // read-only configuration file must not invalidate the memory bank.
+      let settingsStatus: string;
+      try {
+        const settingsPath = await this.updateMcpSettings(absoluteProjectPath);
+        settingsStatus = `configured at ${settingsPath}`;
+      } catch (error: unknown) {
+        settingsStatus = `not updated (${error instanceof Error ? error.message : String(error)})`;
+      }
+
+      const summary = [
+        `Memory Bank initialized at ${memoryBankPath}`,
+        `Created: ${created.length ? created.join(', ') : 'none'}`,
+        `Preserved: ${preserved.length ? preserved.join(', ') : 'none'}`,
+        `MCP settings: ${settingsStatus}`,
+      ].join('\n');
 
       return {
         content: [
           {
             type: 'text',
-            text: 'Memory Bank initialized successfully and MCP settings configured',
+            text: summary,
           },
         ],
       };
     } catch (error: unknown) {
+      if (error instanceof McpError) throw error;
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to initialize Memory Bank: ${error instanceof Error ? error.message : String(error)}`
@@ -672,19 +821,36 @@ Initialization
     }
   }
 
+  private async fileExists(filePath: string): Promise<boolean> {
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async handleUpdateContext(args: any) {
-    const { projectPath, content } = args;
-    if (!projectPath || !content) {
+    const session = args?.content?.currentSession;
+    if (!session || typeof session !== 'object') {
       throw new McpError(
         ErrorCode.InvalidParams,
-        'Project path and content are required'
+        'content.currentSession is required'
+      );
+    }
+    if (typeof session.mode !== 'string' || typeof session.task !== 'string') {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'currentSession.mode and currentSession.task must be strings'
       );
     }
 
+    const { memoryBankPath } = await this.resolveMemoryBankPath(args?.projectPath);
+
     try {
-      const filePath = path.join(projectPath, this.memoryBankPath, 'activeContext.md');
+      const filePath = path.join(memoryBankPath, 'activeContext.md');
       const currentContent = await fs.readFile(filePath, 'utf8');
-      const updatedContent = this.mergeContext(currentContent, content);
+      const updatedContent = this.mergeContext(currentContent, args.content);
       await fs.writeFile(filePath, updatedContent, 'utf8');
 
       return {
@@ -696,6 +862,7 @@ Initialization
         ],
       };
     } catch (error: unknown) {
+      if (error instanceof McpError) throw error;
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update context: ${error instanceof Error ? error.message : String(error)}`
@@ -704,29 +871,45 @@ Initialization
   }
 
   private async handleRecordDecision(args: any) {
-    const { projectPath, decision } = args;
-    if (!projectPath || !decision) {
+    const decision = args?.decision;
+    if (!decision || typeof decision !== 'object') {
       throw new McpError(
         ErrorCode.InvalidParams,
         'Project path and decision are required'
       );
     }
 
+    for (const field of ['title', 'description', 'rationale'] as const) {
+      if (typeof decision[field] !== 'string' || decision[field].trim().length === 0) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `decision.${field} is required and must be a non-empty string`
+        );
+      }
+    }
+
+    const statuses = ['proposed', 'accepted', 'rejected', 'superseded'] as const;
+    const status = statuses.includes(decision.status) ? decision.status : 'accepted';
+    const normalizedDecision: Decision = { ...decision, status };
+
+    const { memoryBankPath } = await this.resolveMemoryBankPath(args?.projectPath);
+
     try {
-      const filePath = path.join(projectPath, this.memoryBankPath, 'decisionLog.md');
+      const filePath = path.join(memoryBankPath, 'decisionLog.md');
       const currentContent = await fs.readFile(filePath, 'utf8');
-      const updatedContent = this.addDecision(currentContent, decision);
+      const updatedContent = this.addDecision(currentContent, normalizedDecision);
       await fs.writeFile(filePath, updatedContent, 'utf8');
 
       return {
         content: [
           {
             type: 'text',
-            text: 'Decision recorded successfully',
+            text: `Decision recorded successfully in the ${status === 'proposed' ? 'pending' : 'technical'} decisions section`,
           },
         ],
       };
     } catch (error: unknown) {
+      if (error instanceof McpError) throw error;
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to record decision: ${error instanceof Error ? error.message : String(error)}`
@@ -735,18 +918,38 @@ Initialization
   }
 
   private async handleTrackProgress(args: any) {
-    const { projectPath, progress } = args;
-    if (!projectPath || !progress) {
+    const progress = args?.progress;
+    if (!progress || typeof progress !== 'object') {
       throw new McpError(
         ErrorCode.InvalidParams,
         'Project path and progress are required'
       );
     }
 
+    const readTaskList = (value: unknown, field: string): string[] => {
+      if (value === undefined || value === null) return [];
+      if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `progress.${field} must be an array of strings`
+        );
+      }
+      return value.map(item => item.trim()).filter(item => item.length > 0);
+    };
+
+    const normalized: { completed: string[]; inProgress: string[]; blocked: string[]; phase?: string } = {
+      completed: readTaskList(progress.completed, 'completed'),
+      inProgress: readTaskList(progress.inProgress, 'inProgress'),
+      blocked: readTaskList(progress.blocked, 'blocked'),
+      phase: typeof progress.phase === 'string' ? progress.phase : undefined,
+    };
+
+    const { memoryBankPath } = await this.resolveMemoryBankPath(args?.projectPath);
+
     try {
-      const filePath = path.join(projectPath, this.memoryBankPath, 'progress.md');
+      const filePath = path.join(memoryBankPath, 'progress.md');
       const currentContent = await fs.readFile(filePath, 'utf8');
-      const updatedContent = this.updateProgress(currentContent, progress);
+      const updatedContent = this.updateProgress(currentContent, normalized);
       await fs.writeFile(filePath, updatedContent, 'utf8');
 
       return {
@@ -758,6 +961,7 @@ Initialization
         ],
       };
     } catch (error: unknown) {
+      if (error instanceof McpError) throw error;
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update progress: ${error instanceof Error ? error.message : String(error)}`
@@ -765,25 +969,31 @@ Initialization
     }
   }
 
-  private async updateMcpSettings(projectPath: string): Promise<void> {
+  private async updateMcpSettings(projectPath: string): Promise<string> {
     try {
       const settingsPath = await this.getMcpSettingsPath();
       const settings = await this.readMcpSettings(settingsPath);
-      
-      // Update memory-bank server configuration
+
+      // Update the memory-bank server configuration while preserving any
+      // user-managed options (for example autoApprove entries).
       settings.mcpServers = settings.mcpServers || {};
+      const existing = settings.mcpServers['memory-bank'];
       settings.mcpServers['memory-bank'] = {
-        command: 'node',
-        args: [path.join(projectPath, 'build', 'index.js')],
+        ...existing,
+        command: process.execPath,
+        args: [this.getServerEntryPath()],
         env: {
-          PROJECT_PATH: projectPath
+          ...(existing?.env || {}),
+          PROJECT_PATH: projectPath,
         },
         disabled: false,
-        autoApprove: []
+        autoApprove: existing?.autoApprove || [],
       };
 
       await this.writeMcpSettings(settingsPath, settings);
+      return settingsPath;
     } catch (error: unknown) {
+      if (error instanceof McpError) throw error;
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update MCP settings: ${error instanceof Error ? error.message : String(error)}`
@@ -791,7 +1001,24 @@ Initialization
     }
   }
 
+  /**
+   * The entry point of this server, used when writing the MCP settings. This
+   * must be this package's build output, not a file inside the target project.
+   */
+  private getServerEntryPath(): string {
+    try {
+      return fileURLToPath(import.meta.url);
+    } catch {
+      return path.resolve(process.argv[1] || path.join('build', 'index.js'));
+    }
+  }
+
   private async getMcpSettingsPath(): Promise<string> {
+    const override = process.env.CLINE_MCP_SETTINGS_PATH;
+    if (override && override.trim().length > 0) {
+      return path.resolve(override.trim());
+    }
+
     let homedir: string;
     try {
       homedir = os.homedir();
@@ -800,13 +1027,21 @@ Initialization
       throw new Error(`Could not determine user home directory: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    const platform = process.platform as keyof typeof MemoryBankServer.MCP_SETTINGS_PATHS;
-    const relativePath = MemoryBankServer.MCP_SETTINGS_PATHS[platform];
-    if (!relativePath) {
-      throw new Error(`Unsupported platform: ${platform}`);
+    const candidates = (MemoryBankServer.MCP_SETTINGS_CANDIDATES as Record<string, string[]>)[process.platform];
+    if (!candidates || candidates.length === 0) {
+      throw new Error(`Unsupported platform: ${process.platform}`);
     }
 
-    return path.join(homedir, relativePath);
+    // Prefer an existing Cline settings file (Stable, Insiders, Cursor,
+    // Windsurf). If none exists yet, fall back to VS Code Stable.
+    for (const relativePath of candidates) {
+      const candidatePath = path.join(homedir, relativePath);
+      if (await this.fileExists(candidatePath)) {
+        return candidatePath;
+      }
+    }
+
+    return path.join(homedir, candidates[0]);
   }
 
   private async readMcpSettings(settingsPath: string): Promise<McpSettings> {
@@ -825,7 +1060,16 @@ Initialization
   private async writeMcpSettings(settingsPath: string, settings: McpSettings): Promise<void> {
     // Ensure settings directory exists
     await fs.mkdir(path.dirname(settingsPath), { recursive: true });
-    await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+
+    // Write atomically so a crash cannot leave Cline with a truncated file.
+    const temporaryPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      await fs.writeFile(temporaryPath, JSON.stringify(settings, null, 2), 'utf8');
+      await fs.rename(temporaryPath, settingsPath);
+    } catch (error) {
+      await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
   private async readMemoryBankFile(projectPath: string, fileName: string): Promise<string> {
@@ -854,26 +1098,33 @@ Initialization
   }
 
   private mergeContext(current: string, update: any): string {
-    const date = new Date().toISOString().split('T')[0];
-    return `${current}\n\n## Session Update (${date})\n- Mode: ${update.currentSession.mode}\n- Task: ${update.currentSession.task}`;
+    const session = update?.currentSession || {};
+    const date = typeof session.date === 'string' && session.date.trim().length > 0
+      ? session.date
+      : new Date().toISOString().split('T')[0];
+    const mode = typeof session.mode === 'string' && session.mode.trim().length > 0
+      ? session.mode
+      : 'Development';
+    const task = typeof session.task === 'string' && session.task.trim().length > 0
+      ? session.task
+      : 'Not specified';
+
+    return `${current.trimEnd()}\n\n## Session Update (${date})\n- Mode: ${mode}\n- Task: ${task}`;
   }
 
   private addDecision(current: string, decision: Decision): string {
     const date = decision.date || new Date().toISOString().split('T')[0];
-    const alternatives = decision.alternatives
+    const alternatives = decision.alternatives?.length
       ? `\n\nAlternatives Considered:\n${decision.alternatives.map((alt: string) => `- ${alt}`).join('\n')}`
       : '';
     const impact = decision.impact ? `\n**Impact:** ${decision.impact}` : '';
-    const related = decision.relatedDecisions
+    const related = decision.relatedDecisions?.length
       ? `\n\nRelated Decisions:\n${decision.relatedDecisions.map((rd: string) => `- ${rd}`).join('\n')}`
       : '';
 
-    // Find the appropriate section based on status
-    const statusSection = decision.status === 'proposed' ? '## Pending Decisions' : '## Technical Decisions';
-    const sections = current.split('\n\n## ');
-    const targetSectionIndex = sections.findIndex(s => s.startsWith('Technical Decisions') || s.startsWith('Pending Decisions'));
-    
-    if (targetSectionIndex === -1) return current; // Fallback if sections not found
+    // Proposed decisions belong in the pending section; every other status
+    // belongs in the technical decisions section.
+    const sectionHeading = decision.status === 'proposed' ? 'Pending Decisions' : 'Technical Decisions';
 
     const newDecision = `### ${decision.title} (${date})
 ${decision.description}
@@ -883,74 +1134,51 @@ ${decision.description}
 Rationale:
 ${decision.rationale}${alternatives}${related}`;
 
-    sections[targetSectionIndex] = sections[targetSectionIndex].trim() + '\n\n' + newDecision;
-    return sections.join('\n\n## ');
-  }
+    const sections = current.trimEnd().split('\n\n## ');
+    const targetSectionIndex = sections.findIndex(section => section.startsWith(sectionHeading));
 
-  private async checkAndPromptProgress(): Promise<void> {
-    if (this.sessionState.questionCount >= 10) {
-      this.sessionState.questionCount = 0; // Reset counter
-      this.sessionState.lastPrompted = new Date().toISOString().split('T')[0];
-      
-      // Auto-save progress
-      await this.saveProgressUpdate();
+    if (targetSectionIndex === -1) {
+      sections.push(`${sectionHeading}\n\n${newDecision}`);
+    } else {
+      sections[targetSectionIndex] = `${sections[targetSectionIndex].trimEnd()}\n\n${newDecision}`;
     }
+
+    return `${sections.join('\n\n## ')}\n`;
   }
 
-  private async saveProgressUpdate(): Promise<void> {
-    const projectPath = process.env.PROJECT_PATH;
-    if (!projectPath) return;
-
-    const progress = {
-      completed: Array.from(this.sessionState.taskUpdates.completed),
-      inProgress: Array.from(this.sessionState.taskUpdates.inProgress),
-      blocked: Array.from(this.sessionState.taskUpdates.blocked)
-    };
-
-    await this.handleTrackProgress({
-      projectPath,
-      progress
-    });
-
-    // Clear the sets after saving
-    this.sessionState.taskUpdates.completed.clear();
-    this.sessionState.taskUpdates.inProgress.clear();
-    this.sessionState.taskUpdates.blocked.clear();
-  }
-
-  private updateProgress(current: string, progress: any): string {
+  private updateProgress(
+    current: string,
+    progress: { completed: string[]; inProgress: string[]; blocked: string[]; phase?: string }
+  ): string {
     const date = new Date().toISOString().split('T')[0];
-    
-    // Add tasks to session state
-    progress.completed?.forEach((task: string) => this.sessionState.taskUpdates.completed.add(task));
-    progress.inProgress?.forEach((task: string) => this.sessionState.taskUpdates.inProgress.add(task));
-    progress.blocked?.forEach((task: string) => this.sessionState.taskUpdates.blocked.add(task));
+    const formatTasks = (tasks: string[], marker: string): string =>
+      tasks.length ? tasks.map(task => `- ${marker} ${task}`).join('\n') : '- None';
 
-    const completed = progress.completed.map((task: string) => `- ✓ ${task}`).join('\n');
-    const inProgress = progress.inProgress.map((task: string) => `- → ${task}`).join('\n');
-    const blocked = progress.blocked
-      ? `\n\nBlocked:\n${progress.blocked.map((task: string) => `- ⚠ ${task}`).join('\n')}`
+    const completed = formatTasks(progress.completed, '✓');
+    const inProgress = formatTasks(progress.inProgress, '→');
+    const blocked = progress.blocked.length
+      ? `\n\nBlocked:\n${formatTasks(progress.blocked, '⚠')}`
       : '';
+    const phase = progress.phase?.trim() || 'Development';
 
-    this.sessionState.questionCount++; // Increment question counter
-    this.checkAndPromptProgress(); // Check if we should prompt for progress save
-
-    return `${current}\n\n## Update (${date})\nPhase: ${this.sessionState.currentPhase}\nQuestions Processed: ${this.sessionState.questionCount}\n\nCompleted:\n${completed}\n\nIn Progress:\n${inProgress}${blocked}`;
+    return `${current.trimEnd()}\n\n## Update (${date})\nPhase: ${phase}\n\nCompleted:\n${completed}\n\nIn Progress:\n${inProgress}${blocked}\n`;
   }
 
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    
-    // Initialize with current phase
-    this.sessionState.currentPhase = 'Development';
     console.error('Memory Bank MCP server running on stdio');
   }
 }
 
+export { MemoryBankServer };
+
 async function handleCliCommand() {
-  if (process.argv[2] === 'initialize_memory_bank') {
+  const command = process.argv[2];
+
+  if (command === 'initialize_memory_bank') {
     const projectPath = process.argv[3];
+    const force = process.argv.includes('--force');
     if (!projectPath) {
       console.error('Error: Project path is required');
       process.exit(1);
@@ -958,18 +1186,46 @@ async function handleCliCommand() {
 
     const server = new MemoryBankServer();
     try {
-      const result = await server.handleInitializeMemoryBank({ projectPath });
+      const result = await server.handleInitializeMemoryBank({ projectPath, force });
       console.log(result.content[0].text);
       process.exit(0);
     } catch (error) {
       console.error('Error:', error instanceof Error ? error.message : String(error));
       process.exit(1);
     }
+  } else if (command === 'help' || command === '--help' || command === '-h') {
+    console.log(`Memory Bank MCP server
+
+Usage:
+  memory-bank-server                        Run as an MCP server over stdio
+  memory-bank-server initialize_memory_bank <projectPath> [--force]
+  memory-bank-server --help
+
+Environment:
+  PROJECT_PATH              Project used for MCP resource reads
+  CLINE_MCP_SETTINGS_PATH   Override the Cline MCP settings file path`);
+    process.exit(0);
   } else {
     // Run as MCP server
     const server = new MemoryBankServer();
-    server.run().catch(console.error);
+    server.run().catch(error => {
+      console.error('Failed to start Memory Bank MCP server:', error);
+      process.exit(1);
+    });
   }
 }
 
-handleCliCommand();
+function isMainModule(): boolean {
+  if (!process.argv[1]) return false;
+
+  const modulePath = fileURLToPath(import.meta.url);
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(modulePath);
+  } catch {
+    return path.resolve(process.argv[1]) === path.resolve(modulePath);
+  }
+}
+
+if (isMainModule()) {
+  handleCliCommand();
+}
