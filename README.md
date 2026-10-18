@@ -19,6 +19,7 @@ A Model Context Protocol server that provides persistent project context managem
 - [File Structure](#file-structure)
 - [Using With Cline](#using-with-cline)
 - [Development](#development)
+- [Deployment](#deployment)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -95,7 +96,7 @@ The Memory Bank seamlessly integrates with the Cline VSCode Extension, requiring
 
 ### Prerequisites
 
-- Node.js (v16 or later)
+- Node.js (v18 or later)
 - VS Code with Cline extension installed
 - TypeScript (for development)
 
@@ -104,7 +105,7 @@ The Memory Bank seamlessly integrates with the Cline VSCode Extension, requiring
 1. Clone and build the server:
 ```bash
 # Clone the repository
-git clone https://github.com/dazeb/cline-mcp-memory-bank
+git clone https://github.com/GlacierEQ/cline-mcp-memory-bank
 cd cline-mcp-memory-bank
 
 # Install dependencies (using pnpm as recommended)
@@ -124,10 +125,10 @@ pnpm run build
    node build/index.js initialize_memory_bank . 
    ```
 
-   **Manual Method (If needed):** Add the following to your Cline MCP settings file. The path varies by OS:
-   - **Linux:** `~/.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
-   - **macOS:** `~/Library/Application Support/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
-   - **Windows:** `%APPDATA%\Code - Insiders\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+   **Manual Method (If needed):** Add the following to your Cline MCP settings file. The initialization command detects an existing settings file automatically; set `CLINE_MCP_SETTINGS_PATH` to point at a custom location.
+   - **Linux:** `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` (or `Code - Insiders`)
+   - **macOS:** `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` (or `Code - Insiders`)
+   - **Windows:** `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json` (or `Code - Insiders`)
 
    Add this JSON object:
 
@@ -139,6 +140,9 @@ pnpm run build
       "args": [
         "/path/to/cline-memory-bank/build/index.js"
       ],
+      "env": {
+        "PROJECT_PATH": "/path/to/project"
+      },
       "disabled": false,
       "autoApprove": []
     }
@@ -146,7 +150,7 @@ pnpm run build
 }
 ```
 
-Replace `/path/to/cline-memory-bank` with the actual, absolute path to your server installation (e.g., `C:\Users\YourUser\Projects\cline-mcp-memory-bank` on Windows). **Note:** Using the initialization command above handles this automatically.
+Replace `/path/to/cline-memory-bank` with the actual, absolute path to your server installation (e.g., `C:\Users\YourUser\Projects\cline-mcp-memory-bank` on Windows). **Note:** Using the initialization command above handles this automatically, including the `PROJECT_PATH` environment variable used by MCP resources.
 
 ## Features
 
@@ -165,9 +169,11 @@ Once initialized, you can ask Cline to update the memory bank context, record de
 1. `initialize_memory_bank`
    - Creates Memory Bank structure for a new project
    - Creates required markdown files with initial templates
+   - Safe to run repeatedly: existing files are preserved unless `force: true`
    ```typescript
    use_mcp_tool('memory-bank', 'initialize_memory_bank', {
-     projectPath: '/path/to/project'
+     projectPath: '/path/to/project',
+     force: false
    });
    ```
 
@@ -189,6 +195,7 @@ Once initialized, you can ask Cline to update the memory bank context, record de
 
 3. `record_decision`
    - Records technical decisions with rationale
+   - `proposed` decisions are filed under Pending Decisions; all other statuses under Technical Decisions
    - Maintains history of architectural choices
    ```typescript
    use_mcp_tool('memory-bank', 'record_decision', {
@@ -197,6 +204,7 @@ Once initialized, you can ask Cline to update the memory bank context, record de
        title: 'Authentication System',
        description: 'Implementing JWT-based authentication',
        rationale: 'Better scalability and stateless operation',
+       status: 'accepted',
        alternatives: [
          'Session-based auth',
          'OAuth only'
@@ -212,6 +220,7 @@ Once initialized, you can ask Cline to update the memory bank context, record de
    use_mcp_tool('memory-bank', 'track_progress', {
      projectPath: '/path/to/project',
      progress: {
+       phase: 'Implementation',
        completed: ['Setup project', 'Initialize database'],
        inProgress: ['Implement auth', 'Create API routes'],
        blocked: ['Deploy to production']
@@ -398,9 +407,40 @@ Simply ask Cline to initialize the memory bank.
 To modify or enhance the server:
 
 1. Update source in `src/index.ts`
-2. Run tests: `npm test`
+2. Run the test suite: `npm test` (builds first, then runs the MCP integration tests)
 3. Build: `npm run build`
-4. Restart Cline extension to load changes
+4. Audit dependencies: `npm audit`
+5. Restart the Cline extension to load changes
+
+The tests exercise the CLI, the stdio MCP protocol, all four tools, and all four resources against temporary fixture projects.
+
+## Deployment
+
+Pushing to `main` or opening a pull request can run the hosted workflow defined in [`docs/ci-workflow.yml`](docs/ci-workflow.yml). The same checks run locally with:
+
+```bash
+npm ci
+npm run ci          # build, test suite, and production dependency audit
+# or: make ci
+```
+
+To enable hosted CI, copy `docs/ci-workflow.yml` to `.github/workflows/ci.yml` and push it with credentials that are allowed to update workflow files.
+
+To publish a release:
+
+```bash
+npm test
+npm pack --dry-run     # inspect the package contents
+npm publish            # requires npm credentials
+```
+
+Consumers can then run the server without a local checkout:
+
+```bash
+npx -y memory-bank-server initialize_memory_bank /path/to/project
+```
+
+The package only ships `build/`, `README.md`, and `LICENSE`; the `prepare` script builds `build/index.js` automatically on install.
 
 ## Contributing
 
